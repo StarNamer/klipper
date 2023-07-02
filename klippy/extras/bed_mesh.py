@@ -4,8 +4,11 @@
 # Copyright (C) 2018-2019 Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, math, json, collections
+import logging, math, json, collections, random
 from . import probe
+
+import debugpy
+debugpy.listen(('0.0.0.0', 5678))
 
 PROFILE_VERSION = 1
 PROFILE_OPTIONS = {
@@ -286,6 +289,8 @@ class ZrefMode:
 
 class BedMeshCalibrate:
     ALGOS = ['lagrange', 'bicubic']
+    PATTERNS = ['zigzag_x', 'linear_x', 'zigzag_y', 'linear_y', 'spiral_in', 'spiral_out', 'random']
+
     def __init__(self, config, bedmesh):
         self.printer = config.get_printer()
         self.orig_config = {'radius': None, 'origin': None}
@@ -323,6 +328,16 @@ class BedMeshCalibrate:
         self.gcode.register_command(
             'BED_MESH_CALIBRATE', self.cmd_BED_MESH_CALIBRATE,
             desc=self.cmd_BED_MESH_CALIBRATE_help)
+    def _add_point(self, points, pos_x, pos_y):
+        if self.radius is None:
+            # rectangular bed, append
+            points.append((pos_x, pos_y))
+        else:
+            # round bed, check distance from origin
+            dist_from_origin = math.sqrt(pos_x*pos_x + pos_y*pos_y)
+            if dist_from_origin <= self.radius:
+                points.append(
+                    (self.origin[0] + pos_x, self.origin[1] + pos_y))
     def _generate_points(self, error):
         x_cnt = self.mesh_config['x_count']
         y_cnt = self.mesh_config['y_count']
@@ -347,24 +362,73 @@ class BedMeshCalibrate:
             max_x = min_x + x_dist * (x_cnt - 1)
         pos_y = min_y
         points = []
-        for i in range(y_cnt):
-            for j in range(x_cnt):
-                if not i % 2:
-                    # move in positive directon
-                    pos_x = min_x + j * x_dist
-                else:
-                    # move in negative direction
-                    pos_x = max_x - j * x_dist
-                if self.radius is None:
-                    # rectangular bed, append
+
+        linear = self.mesh_config['pattern'].startswith('linear_')
+        # match self.mesh_config['pattern']:
+        #     case 'random':
+        if self.mesh_config['pattern'].startswith('random'):
+                xy = []
+                for i in range(x_cnt):
+                    for j in range(y_cnt):
+                        xy.append([min_x + i * x_dist, min_y + j * y_dist])
+                while len(xy) > 0:
+                    r = random.randrange(len(xy))
+                    self._add_point(points, xy[r][0], xy[r][1])
+                    xy.remove(xy[r])
+            # case 'spiral_in' | 'spiral_out':
+        elif self.mesh_config['pattern'].startswith('spiral_'):
+                pos_x = min_x
+                x_lim = x_cnt
+                y_lim = y_cnt
+                while (x_lim > 0):
                     points.append((pos_x, pos_y))
-                else:
-                    # round bed, check distance from origin
-                    dist_from_origin = math.sqrt(pos_x*pos_x + pos_y*pos_y)
-                    if dist_from_origin <= self.radius:
-                        points.append(
-                            (self.origin[0] + pos_x, self.origin[1] + pos_y))
-            pos_y += y_dist
+                    for i in range(x_lim - 1):
+                        pos_x = pos_x + x_dist
+                        self._add_point(points, pos_x, pos_y)
+                    for i in range(y_lim - 1):
+                        pos_y = pos_y + y_dist
+                        self._add_point(points, pos_x, pos_y)
+                    for i in range(x_lim - 1):
+                        pos_x = pos_x - x_dist
+                        self._add_point(points, pos_x, pos_y)
+                    for i in range(y_lim - 2):
+                        pos_y = pos_y - y_dist
+                        self._add_point(points, pos_x, pos_y)
+                    pos_x = pos_x + x_dist
+                    x_lim = x_lim - 2
+                    y_lim = y_lim - 2
+                if self.mesh_config['pattern'].startswith('spiral_out'):
+                    points.reverse()
+            # case 'zigzag_x' | 'linear_x':
+        elif self.mesh_config['pattern'].startswith('zigzag_x') or self.mesh_config['pattern'].startswith('linear_x'):
+                for i in range(y_cnt):
+                    for j in range(x_cnt):
+                        if linear or not i % 2:
+                            # move in positive directon
+                            pos_x = min_x + j * x_dist
+                        else:
+                            # move in negative direction
+                            pos_x = max_x - j * x_dist
+                        self._add_point(points, pos_x, pos_y)
+                    pos_y += y_dist
+            # case 'zigzag_y' | 'linear_y':
+        elif self.mesh_config['pattern'].startswith('zigzag_y') or self.mesh_config['pattern'].startswith('linear_y'):
+                pos_x = min_x
+                for i in range(x_cnt):
+                    for j in range(y_cnt):
+                        if linear or not i % 2:
+                            # move in positive directon
+                            pos_y = min_y + j * y_dist
+                        else:
+                            # move in negative direction
+                            pos_y = max_y - j * y_dist
+                        self._add_point(points, pos_x, pos_y)
+                    pos_x += x_dist
+            # case _:
+        else:
+                self._verify_pattern(error)
+        if self.mesh_config['pattern'].endswith('_rev'):
+                    points.reverse()
         self.points = points
         rri = self.relative_reference_index
         if self.zero_ref_pos is None and rri is not None:
@@ -498,6 +562,8 @@ class BedMeshCalibrate:
         orig_cfg['mesh_y_pps'] = mesh_cfg['mesh_y_pps'] = pps[1]
         orig_cfg['algo'] = mesh_cfg['algo'] = \
             config.get('algorithm', 'lagrange').strip().lower()
+        orig_cfg['pattern'] = mesh_cfg['pattern'] = \
+            config.get('pattern', 'zigzag_x').strip().lower()
         orig_cfg['tension'] = mesh_cfg['tension'] = config.getfloat(
             'bicubic_tension', .2, minval=0., maxval=2.)
         for i in list(range(1, 100, 1)):
@@ -537,6 +603,13 @@ class BedMeshCalibrate:
                                j+1, repr([prev_c1, prev_c3])))
             self.faulty_regions.append((c1, c3))
         self._verify_algorithm(config.error)
+        self._verify_pattern(config.error)
+    def _verify_pattern(self, error):
+        params = self.mesh_config
+        if params['pattern'] not in self.PATTERNS and params['pattern'].removesuffix('_rev') not in self.PATTERNS:
+            raise error(
+                "bed_mesh: Unknown pattern <%s>"
+                % (self.mesh_config['pattern']))
     def _verify_algorithm(self, error):
         params = self.mesh_config
         x_pps = params['mesh_x_pps']
@@ -616,6 +689,10 @@ class BedMeshCalibrate:
             self.mesh_config['algo'] = gcmd.get('ALGORITHM').strip().lower()
             need_cfg_update = True
 
+        if "PATTERN" in params:
+            self.mesh_config['pattern'] = gcmd.get('PATTERN').strip().lower()
+            need_cfg_update = True
+
         if need_cfg_update:
             self._verify_algorithm(gcmd.error)
             self._generate_points(gcmd.error)
@@ -656,10 +733,21 @@ class BedMeshCalibrate:
         self.bedmesh.set_mesh(None)
         self.update_config(gcmd)
         self.probe_helper.start_probe(gcmd)
+    def canonical_mesh(self, mesh):
+        new_mesh = []
+        y_val = sorted(set([row[1] for row in mesh]))
+        odd = False
+        for y in y_val:
+            x_row = [xr for xr in mesh if xr[1] == y]
+            for xv in sorted(x_row, key=lambda a: a[0], reverse=odd):
+                new_mesh.append(xv)
+            odd = not odd
+        return new_mesh
     def probe_finalize(self, offsets, positions):
         x_offset, y_offset, z_offset = offsets
         positions = [[round(p[0], 2), round(p[1], 2), p[2]]
                      for p in positions]
+        positions = self.canonical_mesh(positions)
         if self.zero_reference_mode == ZrefMode.PROBE :
             ref_pos = positions.pop()
             logging.info(
