@@ -289,7 +289,7 @@ class ZrefMode:
 
 class BedMeshCalibrate:
     ALGOS = ['lagrange', 'bicubic']
-    PATTERNS = ['zigzag_x', 'linear_x', 'zigzag_y', 'linear_y', 'spiral_in', 'spiral_out', 'random']
+    PATTERNS = ['zigzag-x', 'linear-x', 'zigzag-y', 'linear-y', 'spiral-in', 'spiral-out', 'random', 'diagonal']
 
     def __init__(self, config, bedmesh):
         self.printer = config.get_printer()
@@ -329,15 +329,20 @@ class BedMeshCalibrate:
             'BED_MESH_CALIBRATE', self.cmd_BED_MESH_CALIBRATE,
             desc=self.cmd_BED_MESH_CALIBRATE_help)
     def _add_point(self, points, pos_x, pos_y):
-        if self.radius is None:
-            # rectangular bed, append
-            points.append((pos_x, pos_y))
-        else:
-            # round bed, check distance from origin
-            dist_from_origin = math.sqrt(pos_x*pos_x + pos_y*pos_y)
-            if dist_from_origin <= self.radius:
-                points.append(
-                    (self.origin[0] + pos_x, self.origin[1] + pos_y))
+        min_x, min_y = self.mesh_min
+        max_x, max_y = self.mesh_max
+        pos_x = round(pos_x, 2)
+        pos_y = round(pos_y, 2)
+        if pos_x >= min_x and pos_y >= min_y and pos_x <= max_x and pos_y <= max_y:
+            if self.radius is None:
+                # rectangular bed, append
+                points.append((pos_x, pos_y))
+            else:
+                # round bed, check distance from origin
+                dist_from_origin = math.sqrt(pos_x*pos_x + pos_y*pos_y)
+                if dist_from_origin <= self.radius:
+                    points.append(
+                        (self.origin[0] + pos_x, self.origin[1] + pos_y))
     def _generate_points(self, error):
         x_cnt = self.mesh_config['x_count']
         y_cnt = self.mesh_config['y_count']
@@ -365,8 +370,20 @@ class BedMeshCalibrate:
 
         linear = self.mesh_config['pattern'].startswith('linear_')
         # match self.mesh_config['pattern']:
+            # case 'zigzag-x' | 'linear-x':
+        if self.mesh_config['pattern'].startswith('zigzag-x') or self.mesh_config['pattern'].startswith('linear-x'):
+                for i in range(y_cnt):
+                    for j in range(x_cnt):
+                        if linear or not i % 2:
+                            # move in positive directon
+                            pos_x = min_x + j * x_dist
+                        else:
+                            # move in negative direction
+                            pos_x = max_x - j * x_dist
+                        self._add_point(points, pos_x, pos_y)
+                    pos_y += y_dist
         #     case 'random':
-        if self.mesh_config['pattern'].startswith('random'):
+        elif self.mesh_config['pattern'].startswith('random'):
                 xy = []
                 for i in range(x_cnt):
                     for j in range(y_cnt):
@@ -375,8 +392,8 @@ class BedMeshCalibrate:
                     r = random.randrange(len(xy))
                     self._add_point(points, xy[r][0], xy[r][1])
                     xy.remove(xy[r])
-            # case 'spiral_in' | 'spiral_out':
-        elif self.mesh_config['pattern'].startswith('spiral_'):
+            # case 'spiral-in' | 'spiral-out':
+        elif self.mesh_config['pattern'].startswith('spiral-'):
                 pos_x = min_x
                 x_lim = x_cnt
                 y_lim = y_cnt
@@ -397,22 +414,25 @@ class BedMeshCalibrate:
                     pos_x = pos_x + x_dist
                     x_lim = x_lim - 2
                     y_lim = y_lim - 2
-                if self.mesh_config['pattern'].startswith('spiral_out'):
+                if self.mesh_config['pattern'].startswith('spiral-out'):
                     points.reverse()
-            # case 'zigzag_x' | 'linear_x':
-        elif self.mesh_config['pattern'].startswith('zigzag_x') or self.mesh_config['pattern'].startswith('linear_x'):
-                for i in range(y_cnt):
-                    for j in range(x_cnt):
-                        if linear or not i % 2:
-                            # move in positive directon
-                            pos_x = min_x + j * x_dist
-                        else:
-                            # move in negative direction
-                            pos_x = max_x - j * x_dist
-                        self._add_point(points, pos_x, pos_y)
-                    pos_y += y_dist
-            # case 'zigzag_y' | 'linear_y':
-        elif self.mesh_config['pattern'].startswith('zigzag_y') or self.mesh_config['pattern'].startswith('linear_y'):
+            # case 'diagonal':
+        elif self.mesh_config['pattern'].startswith('diagonal'):
+            pos_yy = pos_y
+            for i in range(y_cnt + x_cnt - 1):
+                for j in range(x_cnt):
+                    if not i % 2:
+                        # move in positive directon
+                        pos_x = min_x + j * x_dist
+                        pos_yy = pos_y - j * y_dist
+                    else:
+                        # move in negative direction
+                        pos_x = max_x - j * x_dist
+                        pos_yy = pos_y - (x_cnt - 1 - j) * y_dist
+                    self._add_point(points, pos_x, pos_yy)
+                pos_y += y_dist
+            # case 'zigzag-y' | 'linear-y':
+        elif self.mesh_config['pattern'].startswith('zigzag-y') or self.mesh_config['pattern'].startswith('linear-y'):
                 pos_x = min_x
                 for i in range(x_cnt):
                     for j in range(y_cnt):
@@ -427,7 +447,7 @@ class BedMeshCalibrate:
             # case _:
         else:
                 self._verify_pattern(error)
-        if self.mesh_config['pattern'].endswith('_rev'):
+        if self.mesh_config['pattern'].endswith('-rev'):
                     points.reverse()
         self.points = points
         rri = self.relative_reference_index
@@ -608,8 +628,7 @@ class BedMeshCalibrate:
         params = self.mesh_config
         if params['pattern'] not in self.PATTERNS and params['pattern'].removesuffix('_rev') not in self.PATTERNS:
             raise error(
-                "bed_mesh: Unknown pattern <%s>"
-                % (self.mesh_config['pattern']))
+                "bed_mesh: Unknown pattern <%s>" % params['pattern'])
     def _verify_algorithm(self, error):
         params = self.mesh_config
         x_pps = params['mesh_x_pps']
@@ -747,7 +766,7 @@ class BedMeshCalibrate:
         x_offset, y_offset, z_offset = offsets
         positions = [[round(p[0], 2), round(p[1], 2), p[2]]
                      for p in positions]
-        positions = self.canonical_mesh(positions)
+#        positions = self.canonical_mesh(positions)
         if self.zero_reference_mode == ZrefMode.PROBE :
             ref_pos = positions.pop()
             logging.info(
@@ -805,6 +824,8 @@ class BedMeshCalibrate:
                         ", probed = (%.2f, %.2f)"
                         % (off_pt[0], off_pt[1], probed[0], probed[1]))
             positions = corrected_pts
+
+        positions = self.canonical_mesh(positions)
 
         probed_matrix = []
         row = []
